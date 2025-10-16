@@ -1,0 +1,41 @@
+# Byte-compiled / optimized Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+coverage.xml
+
+# Local configuration
+.env
+.env.*
+
+# Runtime logs and data outputs
+trades_log.csv
+*.log
+
+# Editor and OS generated files
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+~$*
+
+# Local project notes and exports
+AGENTS.md
+bot_trade_drift.xlsx
+codex_chat
