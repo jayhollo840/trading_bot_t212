@@ -1,5 +1,11 @@
 import broker
-from broker import Broker, SEED_INITIAL_DELAY, SEED_QTY
+import pytest
+from broker import (
+    Broker,
+    MarketDataUnavailable,
+    SEED_INITIAL_DELAY,
+    SEED_QTY,
+)
 
 
 def test_ensure_seed_handles_delayed_position(monkeypatch):
@@ -38,3 +44,24 @@ def test_ensure_seed_handles_delayed_position(monkeypatch):
     assert len(position_calls) == 6  # 5 misses + 1 success
     assert sleeps and sleeps[0] >= SEED_INITIAL_DELAY
     assert bkr.seed_active is True
+
+
+def test_ensure_seed_raises_when_no_data(monkeypatch):
+    """Ensure seed attempts raise when no position snapshot ever arrives."""
+    monkeypatch.setattr(Broker, "_load_metadata", lambda self: None)
+    bkr = Broker()
+
+    order_calls = []
+
+    def fake_order(symbol, qty):
+        order_calls.append((symbol, qty))
+        return {"ticker": symbol, "quantity": qty}
+
+    monkeypatch.setattr(bkr, "_market_order", fake_order)
+    monkeypatch.setattr(bkr, "_position_raw", lambda symbol: None)
+    monkeypatch.setattr(broker.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(MarketDataUnavailable):
+        bkr._ensure_seed("ITMl_EQ")
+
+    assert order_calls == [("ITMl_EQ", SEED_QTY)]

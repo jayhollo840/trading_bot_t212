@@ -1,5 +1,6 @@
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -13,6 +14,42 @@ SEED_MAX_ATTEMPTS = 12
 SEED_INITIAL_DELAY = 1.0
 SEED_BACKOFF = 1.5
 SEED_MAX_DELAY = 5.0
+
+
+class BrokerError(Exception):
+    """Base exception for broker operations."""
+
+
+class RateLimitError(BrokerError):
+    """Raised when the Trading 212 API rate limits a request."""
+
+    def __init__(self, retry_after: float | None = None, message: str = ""):
+        super().__init__(message or "Hit Trading 212 rate limit.")
+        self.retry_after = retry_after
+
+
+class MarketDataUnavailable(BrokerError):
+    """Raised when price discovery fails after seed attempts."""
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return max(float(text), 0.0)
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(text)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        delta = (retry_at - datetime.now(timezone.utc)).total_seconds()
+        return max(delta, 0.0)
+    except (ValueError, TypeError):
+        return None
 
 
 class Broker:
@@ -45,6 +82,13 @@ class Broker:
     def _req(self, method, path, *, json=None, allow_404=False):
         url = f"{self.base_url}{path if path.startswith('/') else '/' + path}"
         resp = self.session.request(method, url, json=json, timeout=10)
+        if resp.status_code == 429:
+            retry_after = _retry_after_seconds(resp.headers.get("Retry-After"))
+            message = (
+                f"Rate limit encountered calling {url} "
+                f"(retry_after={retry_after if retry_after is not None else 'unknown'}s)."
+            )
+            raise RateLimitError(retry_after=retry_after, message=message)
         if allow_404 and resp.status_code == 404:
             return resp
         resp.raise_for_status()
@@ -135,16 +179,15 @@ class Broker:
                 return data
             wait_seconds = min(wait_seconds * SEED_BACKOFF, SEED_MAX_DELAY)
         self.seed_active = False
-        return None
+        raise MarketDataUnavailable(
+            f"Position snapshot still missing after seeding attempts for {symbol}."
+        )
 
     def get_latest_bar(self, symbol, timeframe="1m"):
         """Return a synthetic OHLC bar using the most recent position snapshot."""
-        data = self._position_raw(symbol) or self._ensure_seed(symbol)
+        data = self._position_raw(symbol)
         if not data:
-            raise RuntimeError(
-                f"Unable to obtain position data for {symbol}. "
-                "Increase SEED_QTY or verify the instrument code and minimum order size."
-            )
+            data = self._ensure_seed(symbol)
         qty = float(data.get("quantity", 0.0))
         if qty >= SEED_QTY - EPS:
             self.seed_active = True

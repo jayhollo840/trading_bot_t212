@@ -4,7 +4,7 @@ import os
 import time
 from statistics import mean
 
-from broker import Broker
+from broker import Broker, MarketDataUnavailable, RateLimitError
 from config import (
     API_BASE_URL,
     API_KEY,
@@ -22,6 +22,14 @@ from config import (
 
 POSITION_EPS = 1e-6
 WINDOW = max(SLOW, 20)
+
+
+def sleep_for_rate_limit(err: RateLimitError, context: str):
+    wait_seconds = max(int((err.retry_after or 30)), 5)
+    print(
+        f"Rate limit while {context}; sleeping {wait_seconds}s before retrying."
+    )
+    time.sleep(wait_seconds)
 
 
 def wait_for_open(bkr: Broker):
@@ -70,13 +78,25 @@ def run():
         print("Warmup complete, entering trading loop")
         while True:
             minutes_left = minutes_to_close(bkr)
-            current_qty = bkr.position(SYMBOL)
+            try:
+                current_qty = bkr.position(SYMBOL)
+            except RateLimitError as exc:
+                sleep_for_rate_limit(exc, "checking open position")
+                continue
             if trade and abs(current_qty) <= POSITION_EPS:
                 trade = None
             if not trade and minutes_left <= NO_NEW_TRADES_MIN:
                 print("Market closing soon, stopping for the day.")
                 break
-            bar = bkr.get_latest_bar(SYMBOL, TIMEFRAME)
+            try:
+                bar = bkr.get_latest_bar(SYMBOL, TIMEFRAME)
+            except RateLimitError as exc:
+                sleep_for_rate_limit(exc, "fetching latest bar")
+                continue
+            except MarketDataUnavailable as exc:
+                print(f"Market data unavailable: {exc}")
+                time.sleep(60)
+                continue
             ts = bar.get("ts")
             if ts == last_ts:
                 time.sleep(5)
@@ -114,7 +134,11 @@ def run():
                         reason = "soft_stop"
                 if reason:
                     exit_qty = trade["qty"]
-                    exit_order = bkr.place_order(SYMBOL, "sell", exit_qty)
+                    try:
+                        exit_order = bkr.place_order(SYMBOL, "sell", exit_qty)
+                    except RateLimitError as exc:
+                        sleep_for_rate_limit(exc, "closing position")
+                        continue
                     order_note = exit_order.get("market", {}).get("id") or reason
                     print(f"{ts} | Exit {reason} qty={exit_qty} price={price:.2f}")
                     log_trade(
@@ -152,7 +176,11 @@ def run():
                 time.sleep(60)
                 continue
 
-            equity = bkr.get_equity()
+            try:
+                equity = bkr.get_equity()
+            except RateLimitError as exc:
+                sleep_for_rate_limit(exc, "fetching account equity")
+                continue
             qty = math.floor((equity * RISK_PCT) / risk_per_share)
             if qty <= 0:
                 time.sleep(60)
@@ -160,7 +188,11 @@ def run():
 
             target = price * (1 + LOSS_THRESHOLD_PCT * TP_R_MULT)
             stop = price * (1 - LOSS_THRESHOLD_PCT)
-            order_result = bkr.place_order(SYMBOL, "buy", qty)
+            try:
+                order_result = bkr.place_order(SYMBOL, "buy", qty)
+            except RateLimitError as exc:
+                sleep_for_rate_limit(exc, "placing entry order")
+                continue
             market_order = order_result.get("market", {})
             order_note = market_order.get("id") or market_order.get("status", "")
             print(
@@ -188,23 +220,50 @@ def run():
             time.sleep(60)
     finally:
         try:
-            remaining = bkr.position(SYMBOL)
+            try:
+                remaining = bkr.position(SYMBOL)
+            except RateLimitError as exc:
+                sleep_for_rate_limit(exc, "checking position during shutdown")
+                try:
+                    remaining = bkr.position(SYMBOL)
+                except RateLimitError:
+                    print(
+                        "Rate limit persisted while checking for open positions. "
+                        "Verify account state manually."
+                    )
+                    remaining = 0.0
             if abs(remaining) > POSITION_EPS:
                 side = "sell" if remaining > 0 else "buy"
                 abs_qty = abs(remaining)
                 print("Flattening position on shutdown")
-                bkr.place_order(SYMBOL, side, abs_qty)
-                log_trade(
-                    {
-                        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                        "price": 0,
-                        "signal": "flatten",
-                        "qty": -abs_qty if side == "sell" else abs_qty,
-                        "sl": "",
-                        "tp": "",
-                        "note": "shutdown",
-                    }
-                )
+                attempts = 0
+                while attempts < 3:
+                    try:
+                        order_response = bkr.place_order(SYMBOL, side, abs_qty)
+                        log_trade(
+                            {
+                                "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                "price": 0,
+                                "signal": "flatten",
+                                "qty": -abs_qty if side == "sell" else abs_qty,
+                                "sl": "",
+                                "tp": "",
+                                "note": order_response.get("market", {}).get(
+                                    "id", "shutdown"
+                                ),
+                            }
+                        )
+                        break
+                    except RateLimitError as exc:
+                        attempts += 1
+                        sleep_for_rate_limit(
+                            exc, "flattening position during shutdown"
+                        )
+                else:
+                    print(
+                        "Unable to flatten position after repeated rate limits. "
+                        "Please close the position manually."
+                    )
         finally:
             bkr.close()
 
