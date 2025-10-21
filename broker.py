@@ -8,7 +8,7 @@ from urllib3.util.retry import Retry
 
 from config import API_BASE_URL, API_KEY, SYMBOL
 
-SEED_QTY = 1.5
+SEED_QTY = 0.1
 EPS = 1e-6
 SEED_MAX_ATTEMPTS = 12
 SEED_INITIAL_DELAY = 1.0
